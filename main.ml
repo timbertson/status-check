@@ -1,20 +1,5 @@
 let verbose = ref false
 
-type status = Success | Error | Progress
-let string_of_status = function
-	| Success -> "success"
-	| Error -> "error"
-	| Progress -> "progress"
-
-let status_types = [ Success; Error; Progress]
-
-let compare_time a b =
-	match a, b with
-		| Some a, Some b -> compare a b
-		| Some a, None -> -1
-		| None, Some a -> 1
-		| None, None -> 0
-
 let string_of_time_diff ?suffix diff =
 	let (units, amount) =
 		let seconds = int_of_float diff in
@@ -38,76 +23,67 @@ let string_of_time_diff ?suffix diff =
 
 let string_ago_of_time_diff = string_of_time_diff ~suffix:"ago"
 
-let progress_desc = function
-	| None -> ""
-	| Some diff -> Printf.sprintf " (but was in progress %s)" (string_ago_of_time_diff diff)
+type result = Ok | Error of string option
+type pid = int
+type progress = Running of pid option
 
-let process ~desc ~max_age =
-	let rec loop ~progress = function
-		| [] -> failwith "process terminated without exiting; that shouldn't happen"
-		| (Success, None) :: _ ->
-			Printf.eprintf "ERROR: %s has never succeeded%s\n" desc (progress_desc progress);
-			exit 1
-		| (Success, Some diff) :: _ ->
-			if diff > max_age then (
-				Printf.eprintf "ERROR: %s hasn't succeeded for more than %s (last success: %s)\n"
-					desc (string_of_time_diff max_age) (string_ago_of_time_diff diff);
-				exit 1
-			) else (
-				(* All good *)
-			)
-		| (Progress, None) ::tail | (Error, None) :: tail -> loop ~progress tail
-		| (Progress, Some diff) :: tail -> loop ~progress:(Some diff) tail
-		| (Error, Some diff) :: _ ->
-			Printf.eprintf "ERROR: %s failed %s%s\n" desc
-				(string_ago_of_time_diff diff) (progress_desc progress);
-			exit 1
-	in
+type 'a status = {
+	age: float;
+	result: 'a;
+}
 
-	fun statuses -> (
-		let statuses = statuses
-			|> List.sort (fun a b -> compare_time (snd a) (snd b))
-			(* |> List.rev *)
-		in
-		if !verbose then statuses |> List.iter (fun (st, time) ->
-			Printf.eprintf " - status `%s`: %s\n" (string_of_status st)
-				(match time with None -> "never" | Some diff -> string_ago_of_time_diff diff)
-		);
-		loop ~progress:None statuses
+let parse_pid = fun str ->
+	Running (
+		try Some (int_of_string (String.trim str))
+		with Failure _ -> None
 	)
 
-let snd (_,b) = b
+let parse_result = fun str ->
+	let space = Str.regexp "[ \t\n]+" in
+	match Str.bounded_split space str 2 with
+		| "ok" :: _ -> Ok
+		| ["error"] -> Error None
+		| ["error"; msg] -> Error (Some (String.trim msg))
+		| [] -> Error (Some ("Status file is empty"))
+		| status :: _ -> Error (Some
+			(Printf.sprintf "Couldn't parse status file: unknown status \"%s\"" status)
+		)
 
-let fetch ~dir ~now status =
+let read_file path =
+	(* NOTE: only reads up to 1kb *)
 	let open Unix in
-	let status_str = string_of_status status in
-	let path = Filename.concat dir status_str in
-	let stats = try Some (stat path) with Unix_error (ENOENT, _, _) -> None in
-	match stats with
-		| None ->
-				if !verbose then
-					Printf.eprintf "%s not found\n" path;
-				None
-		| Some st ->
-			let time = st.st_mtime in
+	let fd = openfile path [O_RDONLY] 0x000 in
+	let buflen = 1024 in
+	let buf = Bytes.create buflen in
+	let len = read fd buf 0 buflen in
+	(fstat fd, Bytes.sub buf 0 len |> Bytes.to_string)
+
+let read_status ~now path parse =
+	let open Unix in
+	let contents = try Some (read_file path) with Unix_error (ENOENT, _, _) -> None in
+	match contents with
+		| Some (stat, contents) ->
+			let time = stat.st_mtime in
 			if time > now then (
 				if !verbose then
-					Printf.eprintf "%s mtime is in the future; ignoring\n" status_str;
+					Printf.eprintf "WARN: mtime is in the future; ignoring %s\n" path;
 				None
-			) else (
-				Some (now -. time)
-			)
+			) else
+				Some { age = now -. time; result = parse contents }
+		| None ->
+			if !verbose then Printf.eprintf "%s not found\n" path;
+			None
 
 let () =
 	let max_age = ref 0 in
 	let desc = ref "job" in
-	let dir = ref None in
+	let path = ref None in
 	Arg.parse [
 		("--max-age", Arg.String (fun age ->
 			max_age := (match Str.full_split (Str.regexp "[0-9]+ ?") age with
 				| [ Str.Delim num; Str.Text units ] ->
 					let units = match units with
-						| "s" | "second" | "seconds" -> 0
+						| "s" | "second" | "seconds" -> 1
 						| "m" | "minute" | "minutes" -> 60
 						| "h" | "hour" | "hours" -> 60 * 60
 						| "d" | "day" | "days" -> 60 * 60 * 24
@@ -127,14 +103,14 @@ let () =
 		("--desc", Arg.Set_string desc, "job description (used in error messages)");
 		("--verbose", Arg.Set verbose, "verbose logging");
 	] (fun arg ->
-		match !dir with
+		match !path with
 			| Some x -> failwith "too many arguments"
-			| None -> dir := Some arg
+			| None -> path := Some arg
 	) "Usage: [OPTIONS] path/to/status";
 
-	let dir = match !dir with
-		| None -> failwith "directory required"
-		| Some dir -> dir
+	let path = match !path with
+		| None -> failwith "path required"
+		| Some path -> path
 	in
 	let desc = !desc in
 	let max_age = match !max_age with
@@ -143,6 +119,70 @@ let () =
 	in
 
 	let now = Unix.time () +. 1.0 in
+	let red = "\027[31;1m" in
+	let dim = "\027[33;1m" in
+	let reset = "\027[0m" in
+	let join = String.concat "" in
 
-	let statuses = status_types |> List.map (fun st -> (st, fetch ~dir ~now st)) in
-	process ~desc ~max_age:(float_of_int max_age) statuses
+	let error = join [red; "ERROR: "; reset] in
+	let error_msg s = s in
+
+	let status = read_status ~now path parse_result in
+	let progress () = read_status ~now (path ^ ".pid") parse_pid in
+	let progress_desc ~result_age () = match progress () with
+		| None -> ""
+		| Some { age; result } ->
+			let is_old = match result_age with
+				| Some result_age -> result_age < age
+				| None -> false
+			in
+			if is_old then "" else (
+				let pid_desc = match result with
+					| Running (Some pid) -> Printf.sprintf ", pid %d" pid
+					| Running None -> ""
+				in
+				join [
+					dim;
+					" (process active ";
+					string_ago_of_time_diff age;
+					pid_desc;
+					")";
+					reset;
+				]
+			)
+	in
+
+	let max_age = float_of_int max_age in
+	match status with
+		| None ->
+			prerr_endline (join [
+				error;
+				error_msg (join [desc; " has no recorded results" ]);
+				progress_desc ~result_age:None ()
+			]);
+			exit 1
+		| Some { result = Ok; age } ->
+			if age > max_age then (
+				prerr_endline (join [
+					error;
+					error_msg (join [
+						desc;
+						" hasn't succeeded for more than ";
+						string_of_time_diff max_age;
+						progress_desc ~result_age:(Some age) ();
+						".";
+					]);
+					" Last success: "; (string_ago_of_time_diff age);
+				]);
+				exit 1
+			) else (
+				(* All good *)
+			)
+		| Some { result = Error err; age } ->
+			prerr_endline (join [
+				join [red; "ERROR ("; desc; ", "; string_ago_of_time_diff age; "): "; reset];
+				error_msg (match err with Some e -> e | None -> "failed");
+				".";
+				progress_desc ~result_age:(Some age) ();
+			]);
+			exit 1

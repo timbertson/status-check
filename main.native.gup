@@ -1,4 +1,0 @@
-#!bash -eu
-gup -u main.ml
-ocamlbuild -use-ocamlfind -package str -package unix "$2"
-[ -e "$2" ] && touch "$2"
