@@ -74,44 +74,69 @@ let read_status ~now path parse =
 			if !verbose then Printf.eprintf "%s not found\n" path;
 			None
 
-let () =
-	let max_age = ref 0 in
-	let desc = ref "job" in
-	let path = ref None in
-	Arg.parse [
-		("--max-age", Arg.String (fun age ->
-			max_age := (match Str.full_split (Str.regexp "[0-9]+ ?") age with
-				| [ Str.Delim num; Str.Text units ] ->
-					let units = match units with
-						| "s" | "second" | "seconds" -> 1
-						| "m" | "minute" | "minutes" -> 60
-						| "h" | "hour" | "hours" -> 60 * 60
-						| "d" | "day" | "days" -> 60 * 60 * 24
-						| other -> failwith ("Unknown units: " ^ other)
-					in
-					let num = int_of_string (String.trim num) in
-					num * units
-				| _other ->
-					(* let open Str in *)
-					(* _other |> List.iter (function *)
-					(* 	| Delim d -> Printf.eprintf " - Delim %s\n" d *)
-					(* 	| Text d -> Printf.eprintf " - Text %s\n" d *)
-					(* ); *)
-					failwith "invalid max-age format (must be \\d+[hmds])"
-			)
-		), "maximum age of last success");
-		("--desc", Arg.Set_string desc, "job description (used in error messages)");
-		("--verbose", Arg.Set verbose, "verbose logging");
-	] (fun arg ->
-		match !path with
-			| Some x -> failwith "too many arguments"
-			| None -> path := Some arg
-	) "Usage: [OPTIONS] path/to/status";
+let write_file_contents ~path str =
+	let f = open_out path in
+	output_string f str;
+	close_out f
 
-	let path = match !path with
-		| None -> failwith "path required"
-		| Some path -> path
+let maxbytes = 1024
+
+let read_tee fd buf =
+	let n = Unix.read fd buf 0 maxbytes in
+	let str = Bytes.sub_string buf 0 n in
+	if n > 0 then output_string stdout str;
+	str
+
+let rec drain fd buf =
+	if read_tee fd buf <> "" then drain fd buf
+
+let rec waitpid_with_retry flags pid =
+	let open Unix in
+	try waitpid flags pid
+	with Unix_error (EINTR, _, _) -> waitpid_with_retry flags pid
+
+let run ~path cmd =
+	let exe = match cmd with
+		| [] -> failwith "Command required"
+		| (exe :: _) -> exe
 	in
+	(* Printf.printf "exec: %s\n" (String.concat " " cmd); *)
+	let open Unix in
+	let r,w = pipe ~cloexec:false () in
+	let pid = fork () in
+	let pid_path = path ^ ".pid" in
+	if pid = 0 then (
+		(* child process: write pid file and run *)
+		close r;
+		dup2 ~cloexec:false w stderr;
+		close w;
+		let pid = getpid () in
+		write_file_contents ~path:pid_path (string_of_int pid);
+		(* replace stderr with the writeable end of the socket *)
+		execvp exe (Array.of_list cmd)
+	) else (
+		(* parent process *)
+		let (status, stderr_contents) = try (
+			close w;
+			let buf = Bytes.make maxbytes ' ' in
+			let stderr_contents = read_tee r buf in
+			drain r buf;
+			(* TODO update PID file occasionally? *)
+			let (_pid, status) = waitpid_with_retry [WUNTRACED] pid in
+			(status, stderr_contents)
+		) with e -> (
+			write_file_contents ~path "error aborted";
+			raise e
+		) in
+		match status with
+			| WEXITED 0 -> write_file_contents ~path "ok"
+			| _ -> (
+				write_file_contents ~path ("error " ^ stderr_contents);
+				exit (match status with WEXITED n -> n | _ -> 1)
+			)
+	)
+
+let check ~desc ~max_age path =
 	let desc = !desc in
 	let max_age = match !max_age with
 		| 0 -> failwith "max-age required"
@@ -186,3 +211,70 @@ let () =
 				progress_desc ~result_age:(Some age) ();
 			]);
 			exit 1
+
+type run_mode = Check | Run of string list
+
+let () =
+	let max_age = ref 0 in
+	let desc = ref "job" in
+	let path = ref None in
+	let mode = ref Check in
+	let string_opt ref = fun value -> ref := Some value in
+	let add_positional_arg = fun arg ->
+		match !mode with
+			| Check -> (
+				match !path with
+					| Some x -> failwith "too many arguments"
+					| None -> path := Some arg
+			)
+			| Run cmd -> mode := Run (cmd @ [arg])
+	in
+	Arg.parse [
+		("--run", Arg.Unit (fun () ->
+			mode := Run [];
+			let max = Array.length Sys.argv in
+			let rec iter = function i ->
+				if i < max then (
+					add_positional_arg (Array.get Sys.argv i);
+					iter (i+1)
+				)
+			in
+			iter (!Arg.current + 1);
+			Arg.current := max
+		), "Remaining arguments are treated as a command to run. " ^
+		   "pid and result files are automatically written, and the contents of stderr " ^
+		   "will be reported as the error message on failure.");
+		("-f", Arg.String (string_opt path), "status file path");
+		("--max-age", Arg.String (fun age ->
+			max_age := (match Str.full_split (Str.regexp "[0-9]+ ?") age with
+				| [ Str.Delim num; Str.Text units ] ->
+					let units = match units with
+						| "s" | "second" | "seconds" -> 1
+						| "m" | "minute" | "minutes" -> 60
+						| "h" | "hour" | "hours" -> 60 * 60
+						| "d" | "day" | "days" -> 60 * 60 * 24
+						| other -> failwith ("Unknown units: " ^ other)
+					in
+					let num = int_of_string (String.trim num) in
+					num * units
+				| _other ->
+					(* let open Str in *)
+					(* _other |> List.iter (function *)
+					(* 	| Delim d -> Printf.eprintf " - Delim %s\n" d *)
+					(* 	| Text d -> Printf.eprintf " - Text %s\n" d *)
+					(* ); *)
+					failwith "invalid max-age format (must be \\d+[hmds])"
+			)
+		), "maximum age of last success");
+		("--desc", Arg.Set_string desc, "job description (used in error messages)");
+		("--verbose", Arg.Set verbose, "verbose logging");
+	] add_positional_arg "Usage: [OPTIONS] path/to/status";
+
+	let path = match !path with
+		| None -> failwith "path required"
+		| Some path -> path
+	in
+
+	match !mode with
+		| Check -> check ~desc ~max_age path
+		| Run cmd -> run ~path cmd

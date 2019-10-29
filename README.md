@@ -8,7 +8,7 @@ Let's say you have a backup script. You've configured it all to run, via `cron`,
 
 You could use any number of server monitoring tools, but those are very involved and require even more infrastructure. And what are they going to do, send you emails? SMS you? That's probably more complex than your periodic task was in the first place - what if those things are misconfigured too?
 
-I wanted a too so stupidly simple that it couldn't _possibly_ give me false positives. This is that tool.
+I wanted a tool so stupidly simple that it couldn't _possibly_ give me false positives. This is that tool.
 
 ## Learn by example:
 
@@ -48,7 +48,7 @@ ERROR (job, 18 seconds ago): something went awry. (process active 9 seconds ago,
 
 ## Where do you call it from?
 
-Where do you _want_ to call it from? Basically, it should be somewhere where the errors will be in your face. I put it in my shell startup file, but I chose to only call it if `stdin` is a tty (to prevent it pissing off automated scripts).
+Where do you _want_ to call it from? Basically, it should be somewhere where the errors will be in your face. I put it in my shell startup file, but I chose to only call it if `stdin` is a tty (to prevent it messing up automated scripts).
 
 In bash / zsh, that's:
 
@@ -76,19 +76,27 @@ end
 
 Super freakin' fast. It's just a couple of `stat()` and `read()` calls. `time` claims it takes about 4 milliseconds, and my machine is not even very fast. You could call it every time you render your shell prompt and you wouldn't notice the difference.
 
-## What do I need to do?
+## What do the status file(s) look like?
 
-As illustrated in the example above, your job will need to write to a status file:
+As illustrated in the example above, a job should:
 
-1. When it completes successfully, it should write `ok` to the status file.
+1. On success: write `ok` to the status file.
 
-2. When it fails, it should write `error` to the status file. This can be followed by a space character and some error message which will be shown to the user.
+2. On error, write `error` to the status file. This can be followed by a space character and some error message which will be shown to the user. e.g. `error oh noes`
 
-3. To indicate that your job is doing something (at startup, and potentially periodically throughout to indicate it's still alive), you can optionally write your process' PID to `<your-status-file>.pid`.
+3. To indicate that a job is doing something (at startup, and potentially periodically throughout to indicate it's still alive), it can optionally write its PID to `<status-file>.pid`.
 
-The modification time of each of the status files will be used to determine what the most recent state of your job is.
+The modification time of the status / pid files will be used to determine what the most recent state of your job is.
 
 That's all.
+
+## Can you write the status file for me?
+
+Sure, if you're happy with some defaults. Run `status-check -f PATH --run some-command -xyz foo` to execute `some-command -xyz foo` with additional tracking:
+
+ - Before executing, the `pid` status file is written.
+ - If the process exits with a zero exit status, `ok` is written to the status file.
+ - If the process is killed or exits unsuccessfully, `error` is written, along with any output that was written to standard error.
 
 ## Compilation
 
