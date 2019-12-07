@@ -23,9 +23,7 @@ let string_of_time_diff ?suffix diff =
 
 let string_ago_of_time_diff = string_of_time_diff ~suffix:"ago"
 
-type result = Ok | Error of string option
 type pid = int
-type progress = Running of pid option
 
 type 'a status = {
 	age: float;
@@ -33,15 +31,14 @@ type 'a status = {
 }
 
 let parse_pid = fun str ->
-	Running (
-		try Some (int_of_string (String.trim str))
-		with Failure _ -> None
-	)
+	let str = String.trim str in
+	try Ok (int_of_string str)
+	with Failure _ -> Error str
 
 let parse_result = fun str ->
 	let space = Str.regexp "[ \t\n]+" in
 	match Str.bounded_split space str 2 with
-		| "ok" :: _ -> Ok
+		| "ok" :: _ -> Ok ()
 		| ["error"] -> Error None
 		| ["error"; msg] -> Error (Some (String.trim msg))
 		| [] -> Error (Some ("Status file is empty"))
@@ -162,18 +159,37 @@ let check ~desc ~max_age path =
 				| None -> false
 			in
 			if is_old then "" else (
-				let pid_desc = match result with
-					| Running (Some pid) -> Printf.sprintf ", pid %d" pid
-					| Running None -> ""
+				let pid = match result with
+					| Ok pid -> (
+						try
+							Unix.kill pid 0;
+							Some pid
+						with Unix.(Unix_error (ESRCH, _, _)) ->
+							None
+					)
+					| Error _ -> None
 				in
-				join [
-					dim;
-					" (process active ";
-					string_ago_of_time_diff age;
-					pid_desc;
-					")";
-					reset;
-				]
+
+				join (match pid with
+					| Some pid ->
+						[
+							dim;
+							" (pid ";
+							string_of_int pid;
+							" active since ";
+							string_ago_of_time_diff age;
+							")";
+							reset;
+						]
+					| None ->
+						[
+							red;
+							" (process dead, active ";
+							string_ago_of_time_diff age;
+							")";
+							reset;
+						]
+				)
 			)
 	in
 
@@ -186,7 +202,7 @@ let check ~desc ~max_age path =
 				progress_desc ~result_age:None ()
 			]);
 			exit 1
-		| Some { result = Ok; age } ->
+		| Some { result = Ok (); age } ->
 			if age > max_age then (
 				prerr_endline (join [
 					error;
