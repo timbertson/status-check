@@ -166,6 +166,9 @@ let check ~desc ~max_age path =
 							Some pid
 						with Unix.(Unix_error (ESRCH, _, _)) ->
 							None
+						with Unix.(Unix_error _) ->
+							(* e.g. EPERM, but anything other than ESRCH implies it's running *)
+							Some pid
 					)
 					| Error _ -> None
 				in
