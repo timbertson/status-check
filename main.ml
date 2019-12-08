@@ -164,11 +164,11 @@ let check ~desc ~max_age path =
 						try
 							Unix.kill pid 0;
 							Some pid
-						with Unix.(Unix_error (ESRCH, _, _)) ->
-							None
-						with Unix.(Unix_error _) ->
-							(* e.g. EPERM, but anything other than ESRCH implies it's running *)
-							Some pid
+						with
+							| Unix.(Unix_error (ESRCH, _, _)) -> None
+
+							(* hopefully EPERM, but non-ESRCH implies it's running *)
+							| Unix.(Unix_error _) -> Some pid
 					)
 					| Error _ -> None
 				in
